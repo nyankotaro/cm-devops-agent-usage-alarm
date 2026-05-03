@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: DevOps Agent monthly investigation hours alarm
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: devops-agent-usage
+    Description: Prefix for resource names
+
+  Schedule:
+    Type: String
+    Default: 1hour
+    AllowedValues:
+      - 5min
+      - 1hour
+      - 6hours
+      - 1day
+    Description: EventBridge Scheduler invocation frequency
+
+  AlarmThresholdHours:
+    Type: Number
+    Default: 160
+    MinValue: 0
+    Description: Threshold in hours for monthly investigation time alarm
+
+  NotificationEmail:
+    Type: String
+    AllowedPattern: ^[^@]+@[^@]+\.[^@]+$
+    Description: Email address for alarm notifications
+
+Mappings:
+  ScheduleConfig:
+    5min:
+      Expression: "rate(5 minutes)"
+      Period: 300
+    1hour:
+      Expression: "rate(1 hour)"
+      Period: 3600
+    6hours:
+      Expression: "rate(6 hours)"
+      Period: 21600
+    1day:
+      Expression: "rate(1 day)"
+      Period: 86400
+
+Resources:
+  # Lambda execution role
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ResourcePrefix}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: devops-agent-and-cloudwatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: aidevops:GetAccountUsage
+                Resource: "*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: Custom/DevOpsAgent
+
+  # Lambda function (inline code)
+  UsagePublisher:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ResourcePrefix}-publisher
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.request
+
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          NAMESPACE = "Custom/DevOpsAgent"
+          METRIC_NAME = "MonthlyInvestigationHours"
+          REGION = os.environ["AWS_REGION"]
+          ENDPOINT = f"https://dp.aidevops.{REGION}.api.aws/usage/account"
+
+          session = boto3.Session()
+          cloudwatch = session.client("cloudwatch", region_name=REGION)
+
+
+          def get_account_usage():
+              request = AWSRequest(method="GET", url=ENDPOINT)
+              SigV4Auth(session.get_credentials(), "aidevops", REGION).add_auth(request)
+              req = urllib.request.Request(
+                  ENDPOINT, method="GET", headers=dict(request.headers)
+              )
+              with urllib.request.urlopen(req, timeout=10) as response:
+                  return json.loads(response.read())
+
+
+          def lambda_handler(event, context):
+              response = get_account_usage()
+              usage = response["monthlyAccountInvestigationHours"]["usage"]
+              limit = response["monthlyAccountInvestigationHours"]["limit"]
+
+              cloudwatch.put_metric_data(
+                  Namespace=NAMESPACE,
+                  MetricData=[
+                      {
+                          "MetricName": METRIC_NAME,
+                          "Value": usage,
+                          "Unit": "Count",
+                      },
+                  ],
+              )
+
+              return {"usage": usage, "limit": limit}
+
+  # EventBridge Scheduler execution role
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ResourcePrefix}-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-lambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt UsagePublisher.Arn
+
+  # EventBridge Scheduler
+  Scheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${ResourcePrefix}-schedule
+      FlexibleTimeWindow: { Mode: "OFF" }
+      ScheduleExpression: !FindInMap [ScheduleConfig, !Ref Schedule, Expression]
+      Target:
+        Arn: !GetAtt UsagePublisher.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+
+  # SNS Topic
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ResourcePrefix}-alarm
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm
+  MonthlyUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourcePrefix}-monthly-usage
+      AlarmDescription: DevOps Agent monthly investigation hours exceeded threshold
+      Namespace: Custom/DevOpsAgent
+      MetricName: MonthlyInvestigationHours
+      Statistic: Maximum
+      Period: !FindInMap [ScheduleConfig, !Ref Schedule, Period]
+      EvaluationPeriods: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: !Ref AlarmThresholdHours
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+  LambdaFunctionName:
+    Value: !Ref UsagePublisher
+  AlarmName:
+    Value: !Ref MonthlyUsageAlarm
+  SnsTopicArn:
+    Value: !Ref AlarmTopic
